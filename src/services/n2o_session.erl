@@ -1,5 +1,5 @@
 -module(n2o_session).
--compile(export_all).
+-compile([nowarn_unused_function]).
 -include_lib("stdlib/include/ms_transform.hrl").
 -description('N2O Session').
 -export([authenticate/2, get_value/3, set_value/3, storage/0, prolongate/0, from/1, ttl/0, till/2]).
@@ -18,11 +18,17 @@ storage()     -> application:get_env(n2o,session_storage,n2o_session).
 token(A)      -> (storage()):update(A), {'Token',n2o:pickle(A)}.
 token(A,P)    -> (storage()):update(A), {'Token',P}.
 ttl()         -> application:get_env(n2o,ttl,60*15).
-till(Now,TTL) -> from(to(Now)+TTL).
+till(Now,TTL) -> 
+    case is_atom(TTL) of
+        true -> TTL;
+        false -> from(to(Now)+TTL)
+    end.
 prolongate()  -> application:get_env(n2o,nitro_prolongate,false).
 sid(Seed)     -> n2o_secret:sid(Seed).
 
 % API
+
+new() -> token(auth(sid(os:timestamp()),expire())).
 
 authenticate([], Pickle) ->
     case n2o:depickle(Pickle) of
@@ -30,10 +36,11 @@ authenticate([], Pickle) ->
         {{Sid,'auth'},{Till,[]}} = Auth ->
             case {expired(Till), prolongate()} of
                  {false,false} -> token(Auth,Pickle);
-                  {false,true} -> token(auth(Sid,expire()));
-                      {true,_} -> (storage()):delete({Sid,auth}),
-                                  token(auth(sid(os:timestamp()),expire()))
-            end
+                  {false,true} -> move(Sid), token(auth(Sid,expire()));
+                  {true,false} -> (storage()):delete({Sid,auth}), new();
+                   {true,true} -> move(Sid), (storage()):delete({Sid,auth}), new()
+            end;
+       _ -> new()
     end.
 
 get_value(Session, Key, Default) ->
@@ -45,6 +52,10 @@ get_value(Session, Key, Default) ->
 
 set_value(Session, Key, Value) ->
     (storage()):update({{Session,Key},{expire(),Value}}), Value.
+
+move(Sid) ->
+    [ (storage()):update({{Sid,Key},{expire(),Val}}) || {{_,Key},{_,Val}} <- ets:select(cookies,
+        ets:fun2ms(fun(A) when (element(1,element(1,A)) == Sid) -> A end)) ], ok.
 
 clear(Session) ->
     [ ets:delete(cookies,X) || X <- ets:select(cookies,

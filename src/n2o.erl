@@ -1,58 +1,64 @@
 -module(n2o).
--compile(export_all).
--description('N2O DAS MQTT TCP WebSocket').
+-description('N2O Application Server').
 -behaviour(supervisor).
 -behaviour(application).
--include("n2o.hrl").
--include("n2o_core.hrl").
--include("n2o_api.hrl").
--export([start/2, stop/1, init/1, proc/2, version/0, ring/0, to_binary/1, bench/0]).
+-include_lib("n2o/include/n2o.hrl").
+-include_lib("n2o/include/n2o_core.hrl").
+-include_lib("n2o/include/n2o_api.hrl").
+-export([start/2, stop/1, init/1, proc/2, version/0, to_binary/1, bench/0]).
 
 % SERVICES
 
--export([send/2,reg/1,unreg/1,reg/2]).        % mq
--export([pickle/1,depickle/1]).               % pickle
--export([encode/1,decode/1]).                 % format
--export([session/1,session/2,user/1,user/0]). % session
+-export([send/2,reg/1,unreg/1,reg/2]).                 % pubsub
+-export([pickle/1,depickle/1]).                        % pickle
+-export([encode/1,decode/1]).                          % format
+-export([session/1,session/2,user/1,user/0]).          % session
 -export([cache/2,cache/3,cache/4,invalidate_cache/1]). % cache
+-export([start_mqtt/0,start_ws/0,start_tcp/0,sid/0]).  % session
 
 % START VNODE HASH RING
 
-stop(_)    -> catch n2o_vnode:unload(), ok.
-start(_,_) -> catch n2o_vnode:load([]), X = supervisor:start_link({local,n2o},n2o, []),
-              n2o_pi:start(#pi{module=?MODULE,table=caching,sup=n2o,state=[],name="timer"}),
-              [ n2o_pi:start(#pi{module=n2o_vnode,table=ring,sup=n2o,state=[],name=Pos})
-                || {{_,_},Pos} <- lists:zip(ring(),lists:seq(1,length(ring()))) ],
-                X.
+init([])   -> storage_init(), mq_init(), { ok, { { one_for_one, 1000, 10 }, [] } }.
+stop(_)    -> ok.
+bench()    -> ok.
+start(_,_) -> S = supervisor:start_link({local,n2o},n2o,[]),
 
-ring()         -> array:to_list(n2o_ring:ring()).
-rand_vnode()   -> rand:uniform(length(ring())).
+              start_timer(),
+              Space      = 4,                 % ring partitions
+              Default    = [ erp ],           % applications
+              Protocols  = [ mqtt, ws, tcp ], % protocols
+
+              % Generic loop for applications, its rings and exposed protocols
+
+            [ begin
+                lists:flatmap(fun(B) ->
+                  Key = fun(I) -> lists:concat(["/",P,"/",B,"/",I]) end,
+                  X = lists:map(fun(I) -> Key(I) end, lists:seq(1,Space)),
+                  application:set_env(B,n2o_ring:tab2ring(P),n2o_ring:new(Space,X)),
+                  X end, application:get_env(n2o,n2o_ring:tab2srv(P),Default))
+              end || P <- Protocols ],
+
+              S.
+
+start_mqtt()     -> lists:map(fun start_mqtt/1, n2o_ring:members(mqtt)).
+start_ws()       -> lists:map(fun start_ws/1,   n2o_ring:members(ws)).
+start_tcp()      -> lists:map(fun start_tcp/1,  n2o_ring:members(tcp)).
+
+start_mqtt(Node) -> n2o_pi:start(#pi{module=n2o_mqtt,table=mqtt,   sup=n2o,state=[],name=Node}).
+start_ws(Node)   -> n2o_pi:start(#pi{module=n2o_ws,  table=ws,     sup=n2o,state=[],name=Node}).
+start_tcp(Node)  -> n2o_pi:start(#pi{module=n2o_tcp, table=tcp,    sup=n2o,state=[],name=Node}).
+start_timer()    -> n2o_pi:start(#pi{module=n2o,     table=caching,sup=n2o,state=[],name="/timer"}).
+
+% ETS
+
 opt()          -> [ set, named_table, { keypos, 1 }, public ].
-tables()       -> application:get_env(n2o,tables,[ cookies, file, caching, ring, async ]).
+tables()       -> application:get_env(n2o,tables,[ cookies, file, caching, ws, mqtt, tcp, async ]).
 storage_init() -> [ ets:new(X,opt()) || X <- tables() ].
-init([])       -> storage_init(),
-                  n2o_ring:init([{node(),1,4}]),
-                  { ok, { { one_for_one, 1000, 10 }, [] } }.
-
-% MQTT vs OTP benchmarks
-
-bench() -> [bench_mqtt(),bench_otp()].
-run()   -> 10000.
-
-bench_mqtt() -> N = run(), {T,_} = timer:tc(fun() -> [ begin Y = lists:concat([X rem 16]),
-    n2o_vnode:send_reply(<<"clientId">>,n2o:to_binary(["events/1/",Y]),term_to_binary(X))
-                               end || X <- lists:seq(1,N) ], ok end),
-           {mqtt,trunc(N*1000000/T),"msgs/s"}.
-
-bench_otp() -> N = run(), {T,_} = timer:tc(fun() ->
-     [ n2o_ring:send({publish, n2o:to_binary(["events/1/",
-              lists:concat([(X rem length(n2o:ring())) + 1]),"/index/anon/room/"]),
-                      term_to_binary(X)}) || X <- lists:seq(1,N) ], ok end),
-     {otp,trunc(N*1000000/T),"msgs/s"}.
 
 % MQ
 
 mq()      -> application:get_env(n2o,mq,n2o_gproc).
+mq_init() -> (mq()):init().
 send(X,Y) -> (mq()):send(X,Y).
 reg(X)    -> (mq()):reg(X).
 unreg(X)  -> (mq()):unreg(X).
@@ -66,30 +72,36 @@ depickle(SerializedData) -> (pickler()):depickle(SerializedData).
 
 % SESSION
 
+sid() -> #cx{session=SID}=get(context), SID.
 session() -> application:get_env(n2o,session,n2o_session).
-session(Key)        -> #cx{session=SID}=get(context), (session()):get_value(SID, Key, []).
+session(Key) ->
+    Context = get(context),
+    case Context of
+        #cx{session=SID} -> (session()):get_value(SID, Key, []);
+        _ -> []
+    end.
 session(Key, Value) -> #cx{session=SID}=get(context), (session()):set_value(SID, Key, Value).
-user()              -> case session(user) of undefined -> []; E -> lists:concat([E]) end.
+user()              -> case session(user) of undefined -> []; E -> E end.
 user(User)          -> session(user,User).
 
 % FORMAT
 
-formatter() -> application:get_env(n2o,formatter,n2o_bert).
+formatter()  -> application:get_env(n2o,formatter,n2o_bert).
 encode(Term) -> (formatter()):encode(Term).
 decode(Term) -> (formatter()):decode(Term).
 
 % CACHE
 
-cache(Tab, Key, Value, Till) -> ets:insert(Tab,{Key,Till,Value}), Value.
+cache(Tab, Key, Value, Till) -> ets:insert(Tab,{Key,{Till,Value}}), Value.
 cache(Tab, Key, undefined)   -> ets:delete(Tab,Key);
-cache(Tab, Key, Value)       -> ets:insert(Tab,{Key,n2o_session:till(calendar:local_time(),
-                                                    n2o_session:ttl()),Value}), Value.
+cache(Tab, Key, Value)       -> ets:insert(Tab,{Key,{n2o_session:till(calendar:local_time(),
+                                                    n2o_session:ttl()),Value}}), Value.
 cache(Tab, Key) ->
     Res = ets:lookup(Tab,Key),
     Val = case Res of [] -> []; [Value] -> Value; Values -> Values end,
     case Val of [] -> [];
-                {_,infinity,X} -> X;
-                {_,Expire,X} -> case Expire < calendar:local_time() of
+                {_,{infinity,X}} -> X;
+                {_,{Expire,X}} -> case Expire < calendar:local_time() of
                                   true ->  ets:delete(Tab,Key), [];
                                   false -> X end end.
 
@@ -103,7 +115,7 @@ proc({timer,ping},#pi{state=Timer}=Async) ->
     erlang:cancel_timer(Timer),
     n2o:invalidate_cache(caching),
     (n2o_session:storage()):invalidate_sessions(),
-    {reply,ok,Async#pi{state=timer_restart(ping())}}.
+    {noreply,Async#pi{state=timer_restart(ping())}}.
 
 invalidate_cache(Table) -> ets:foldl(fun(X,_) -> n2o:cache(Table,element(1,X)) end, 0, Table).
 timer_restart(Diff) -> {X,Y,Z} = Diff, erlang:send_after(1000*(Z+60*Y+60*60*X),self(),{timer,ping}).

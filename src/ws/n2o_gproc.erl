@@ -1,8 +1,9 @@
 -module(n2o_gproc).
 -description('N2O GPROC MQ Backend').
--include("n2o.hrl").
+-include_lib("n2o/include/n2o.hrl").
 -export(?MESSAGE_API).
 
+init() -> ok.
 send(Pool, Message) -> gproc:send({p,l,Pool},Message).
 reg(Pool) -> reg(Pool,undefined).
 reg(Pool, Value) ->

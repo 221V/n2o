@@ -1,11 +1,11 @@
 -module(n2o_pi).
--description('N2O Process').
--include("n2o.hrl").
--include("n2o_pi.hrl").
+-description('N2O Process Instance'). % gen_server replacement
+-include_lib("n2o/include/n2o.hrl").
+-include_lib("n2o/include/n2o_pi.hrl").
 -behaviour(gen_server).
 -export([start_link/1]).
 -export([init/1,handle_call/3,handle_cast/2,handle_info/2,terminate/2,code_change/3]).
--export([start/1,stop/2,send/2,send/3,pid/2,restart/2]).
+-export([start/1,stop/2,send/2,send/3,cast/2,cast/3,pid/2,restart/2]).
 
 start(#pi{table=Tab,name=Name,module=Module,sup=Sup} = Async) ->
     ChildSpec = {{Tab,Name},{?MODULE,start_link,[Async]},
@@ -28,6 +28,9 @@ stop(Tab,Name) ->
 send(Pid,Message) when is_pid(Pid) -> gen_server:call(Pid,Message).
 send(Tab,Name,Message) -> gen_server:call(n2o_pi:pid(Tab,Name),Message).
 
+cast(Pid,Message) when is_pid(Pid) -> gen_server:cast(Pid,Message).
+cast(Tab,Name,Message) -> gen_server:cast(n2o_pi:pid(Tab,Name),Message).
+
 pid(Tab,Name) -> n2o:cache(Tab,{Tab,Name}).
 
 restart(Tab,Name) ->
@@ -35,17 +38,31 @@ restart(Tab,Name) ->
           #pi{}=Async -> start(Async);
                      Error -> Error end.
 
+handle(Mod,Message,Async) ->
+  case Mod:proc(Message,Async) of
+                {ok,S} -> {ok,S};
+              {ok,S,T} -> {ok,S,T};
+          {stop,X,Y,S} -> {stop,X,Y,S};
+            {stop,X,S} -> {stop,X,S};
+         {reply,X,S,T} -> {reply,X,S,T};
+           {reply,X,S} -> {reply,X,S};
+         {noreply,X,S} -> {noreply,X,S};
+           {noreply,S} -> {noreply,S};
+                 {_,S} -> {noreply,S};
+                     S -> {noreply,S} end.
+
 start_link (Parameters)    -> gen_server:start_link(?MODULE, Parameters, []).
 code_change(_,State,_)     -> {ok, State}.
 handle_call({get},_,Async) -> {reply,Async,Async};
-handle_call(Message,_,#pi{module=Mod}=Async) -> Mod:proc(Message,Async).
-handle_cast(Message,  #pi{module=Mod}=Async) -> Mod:proc(Message,Async).
-handle_info(timeout,  #pi{module=Mod}=Async) -> Mod:proc(timeout,Async);
-handle_info(Message,  #pi{module=Mod}=Async) ->
-    {noreply,case Mod:proc(Message,Async) of
-                  {_,_,S} -> S;
-                    {_,S} -> S;
-                        S -> S end}.
+handle_call(_,_,#pi{module=undefined}) -> {noreply,[]};
+handle_call(Message,_,#pi{module=Mod}=Async) -> handle(Mod,Message,Async).
+handle_cast(_,  #pi{module=undefined}) -> {noreply,[]};
+handle_cast(Message,  #pi{module=Mod}=Async) -> handle(Mod,Message,Async).
+handle_info(timeout,  #pi{module=undefined}) -> {noreply,[]};
+handle_info(timeout,  #pi{module=Mod}=Async) -> handle(Mod,timeout,Async);
+handle_info(_,  #pi{module=undefined}) -> {noreply,[]};
+handle_info(Message,  #pi{module=Mod}=Async) -> handle(Mod,Message,Async);
+handle_info(_,  _) -> {noreply,[]}.
 
 init(#pi{module=Mod,table=Tab,name=Name}=Handler) ->
     n2o:cache(Tab,{Tab,Name},self(),infinity),
@@ -53,6 +70,5 @@ init(#pi{module=Mod,table=Tab,name=Name}=Handler) ->
 
 terminate(_Reason, #pi{name=Name,sup=Sup,table=Tab}) ->
     spawn(fun() -> supervisor:delete_child(Sup,{Tab,Name}) end),
-    io:format("n2o_pi:terminate~n"),
-    n2o:cache(Tab,{Tab,Name},undefined), ok.
+    catch n2o:cache(Tab,{Tab,Name},undefined), ok.
 
